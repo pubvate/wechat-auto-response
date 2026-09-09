@@ -1,0 +1,12 @@
+# 微信自动回复机器人依赖
+pyautogui
+pyperclip
+pynput
+Pillow
+easyocr
+opencv-python
+numpy
+openai
+python-dotenv
+# Windows 窗口激活（仅 Windows 需要）
+pygetwindow; sys_platform == "win32"

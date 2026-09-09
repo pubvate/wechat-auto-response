@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.env
+memory.json
+chat_history/
+.workbuddy/
+.DS_Store
+.pytest_cache/
+.vscode/
+
+# 含个人隐私的运行期数据：只入库同名 .example.json 模板
+config/personas.json
+config/stickers.json
+config/sticker_cache.json
+config/regions.json

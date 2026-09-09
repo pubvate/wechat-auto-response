@@ -1,0 +1,6 @@
+{
+  "_说明1": "表情包配置模板。使用方式：cp config/stickers.example.json config/stickers.json（Windows 用 copy）。",
+  "_说明2": "emotion_map：情绪 → 自定义表情面板第几个（第 1 格从 1 开始数，先行后列）。近义词可以映射到同一个格子。",
+  "_说明3": "columns：表情面板每行格子数，按自己面板的实际情况改。",
+  "_说明4": "panel 字段由 GUI「表情包配置 → 标定表情面板」自动生成，未标定时表情包功能不生效。"
+}

@@ -1,0 +1,14 @@
+WeChat-DeepSeek-Auto-Response
+Copyright 2026 LaoChouPro
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+本项目基于截图 OCR + 屏幕自动化实现，仅用于学习与技术交流。
+使用者需自行遵守所在地区法律法规与第三方平台（含腾讯微信）的相关协议，
+因使用本项目造成的任何账号风险或法律责任，由使用者自行承担。
+
+第三方依赖许可证见 THIRD_PARTY_NOTICES.md。
