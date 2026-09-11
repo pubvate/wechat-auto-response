@@ -4,13 +4,14 @@
 - 纯逻辑（读写 stickers.json、坐标推算、标记解析）在 core/stickers.py，可单测；
 - 本文件只做 tkinter 界面，失败弹窗提示，不影响主程序。
 
-标定流程（点 4 下，全局鼠标监听，1.5 秒后开始采集避免误捕「确定」按钮）：
-点击面板里的格子表情后，微信会自动收起表情面板，因此每个格子点完
-都需要重新点 ☺ 按钮把面板再打开：
+标定流程（点 5 下，全局鼠标监听，1.5 秒后开始采集避免误捕「确定」按钮）：
+点击面板里的格子表情后，微信会自动收起表情面板，且首次打开面板时停在
+「默认表情」页而非「自定义表情」页，因此需要两次打开面板：
   ① 微信输入框左侧的 ☺ 表情按钮（打开面板）
-  ② 弹出面板中自定义表情第一行第一格的中心（面板自动关闭）
-  ③ 再次点击 ☺ 表情按钮（重新打开面板）
-  ④ 第一行第二格的中心（用于推算格子间距）
+  ② 面板中「自定义表情」分组（切换到自定义表情页；已在该页时多点一次也无妨）
+  ③ 自定义表情第一行第一格的中心（点击即发送，面板自动关闭）
+  ④ 再次点击 ☺ 表情按钮（重新打开面板，此时仍停留在自定义表情页）
+  ⑤ 自定义表情第一行第二格的中心（用于推算格子间距）
 """
 
 import queue
@@ -63,16 +64,18 @@ class StickerConfigWindow:
         calib.pack(fill=tk.X)
         self.lbl_panel = ttk.Label(calib, text="", foreground="#555555")
         self.lbl_panel.pack(anchor=tk.W)
-        ttk.Button(calib, text="标定表情面板（4 次点击）",
+        ttk.Button(calib, text="标定表情面板（5 次点击）",
                    command=self._start_calibration).pack(anchor=tk.W, pady=(4, 0))
         ttk.Button(calib, text="测试发送（先打开一个微信聊天）",
                    command=self._test_send).pack(anchor=tk.W, pady=(4, 8))
 
         ttk.Label(
             self.top, wraplength=430, justify=tk.LEFT, foreground="#888888",
-            text="标定步骤（共 4 次点击）：① 点击微信输入框左侧 ☺ 表情按钮打开面板；"
-                 "② 点击面板中自定义表情第一行第一格中心（面板会自动关闭）；"
-                 "③ 再次点击 ☺ 表情按钮重新打开面板；④ 点击第一行第二格中心。"
+            text="标定步骤（共 5 次点击）：① 点击微信输入框左侧 ☺ 表情按钮打开面板；"
+                 "② 点击面板中的「自定义表情」分组，切换到自定义表情页；"
+                 "③ 点击自定义表情第一行第一格中心（面板会自动关闭）；"
+                 "④ 再次点击 ☺ 表情按钮重新打开面板（仍停在自定义表情页）；"
+                 "⑤ 点击第一行第二格中心。"
                  "注意：点击格子表情会被发送到当前聊天，属正常现象。"
                  "标定后每行格数可在 config/stickers.json 的 columns 调整。",
             padding=(10, 0)).pack(fill=tk.X, pady=(0, 10))
@@ -176,7 +179,12 @@ class StickerConfigWindow:
             self.lbl_panel.config(
                 text=f"表情面板：已标定  笑脸{panel['smiley']}  首格{panel['cell1']}")
 
-    # ---------- 面板标定（后台线程采集 4 次全局点击） ----------
+    # ---------- 面板标定（后台线程采集 5 次全局点击） ----------
+
+    # 5 次点击各自的含义，下标即采集顺序
+    CALIB_STEPS = ("☺ 表情按钮", "自定义表情分组", "第一行第一格",
+                   "☺ 表情按钮（重开）", "第一行第二格")
+    CALIB_CLICKS = len(CALIB_STEPS)
 
     def _start_calibration(self):
         if getattr(self, "_calibrating", False):
@@ -184,11 +192,12 @@ class StickerConfigWindow:
             return
         answer = messagebox.askokcancel(
             "表情面板标定",
-            "接下来请依次点击 4 个位置（点格子后面板会关闭，需重开）：\n\n"
+            "接下来请依次点击 5 个位置（点格子后面板会关闭，需重开）：\n\n"
             "① 微信聊天输入框左侧的 ☺ 表情按钮（打开面板）\n"
-            "② 弹出面板中自定义表情第一行第一格的中心\n"
-            "③ 再次点击 ☺ 表情按钮（重新打开面板）\n"
-            "④ 第一行第二格的中心\n\n"
+            "② 面板中的「自定义表情」分组（若已在该页，多点一次也无妨）\n"
+            "③ 自定义表情第一行第一格的中心（面板会自动关闭）\n"
+            "④ 再次点击 ☺ 表情按钮（重新打开面板，仍是自定义表情页）\n"
+            "⑤ 自定义表情第一行第二格的中心\n\n"
             "提示：点击格子表情会把该表情发送到当前聊天，属正常现象。\n"
             "点「确定」后 1.5 秒开始采集点击，期间请不要点击微信以外的地方。",
             parent=self.top)
@@ -198,15 +207,16 @@ class StickerConfigWindow:
         threading.Thread(target=self._calibration_worker, daemon=True).start()
 
     def _calibration_worker(self):
-        """后台线程：1.5 秒缓冲后全局监听 4 次左键点击（限时 60 秒），结果入队。
+        """后台线程：1.5 秒缓冲后全局监听 5 次左键点击（限时 60 秒），结果入队。
 
         用 Event + listener.stop() 显式收尾，不依赖 pynput 回调返回值的
         「返回 False 停止监听」语义，避免只识别第一次就停下的问题。
         """
         import time
         time.sleep(1.5)
-        print("【表情面板标定】请在微信中依次点击：① ☺表情按钮 ② 第一行第一格 "
-              "③ ☺表情按钮（重开面板） ④ 第一行第二格（限时 60 秒）")
+        print("【表情面板标定】请在微信中依次点击："
+              "① ☺表情按钮 ② 自定义表情分组 ③ 第一行第一格 "
+              "④ ☺表情按钮（重开面板） ⑤ 第一行第二格（限时 60 秒）")
         clicks = []
         done = threading.Event()
 
@@ -214,9 +224,11 @@ class StickerConfigWindow:
             # 只采集按下事件；回调返回 None 即继续监听
             if not pressed:
                 return
+            step = min(len(clicks), self.CALIB_CLICKS - 1)
             clicks.append((int(x), int(y)))
-            print(f"【表情面板标定】已捕获 {len(clicks)}/4：({x:.0f}, {y:.0f})")
-            if len(clicks) >= 4:
+            print(f"【表情面板标定】已捕获 {len(clicks)}/{self.CALIB_CLICKS}"
+                  f"（{self.CALIB_STEPS[step]}）：({x:.0f}, {y:.0f})")
+            if len(clicks) >= self.CALIB_CLICKS:
                 done.set()
 
         listener = mouse.Listener(on_click=on_click)
@@ -232,7 +244,8 @@ class StickerConfigWindow:
             pass
         if not finished:
             self._calib_queue.put(
-                {"error": "采集超时：60 秒内未完成 4 次点击，已取消。请重新标定。"})
+                {"error": f"采集超时：60 秒内未完成 {self.CALIB_CLICKS} 次点击，"
+                          "已取消。请重新标定。"})
             return
         self._calib_queue.put({"clicks": clicks})
 
@@ -257,17 +270,18 @@ class StickerConfigWindow:
 
     def _handle_calibration_result(self, clicks):
         """处理已采集的点击坐标：校验 + 保存面板标定。"""
-        if len(clicks) < 4:
-            messagebox.showwarning("未完成", "采集到的点击不足 4 次，请重新标定。",
+        if len(clicks) < self.CALIB_CLICKS:
+            messagebox.showwarning("未完成",
+                                   f"采集到的点击不足 {self.CALIB_CLICKS} 次，请重新标定。",
                                    parent=self.top)
             return
-        smiley, cell1, smiley2, cell2 = clicks
+        smiley, tab, cell1, smiley2, cell2 = clicks[:self.CALIB_CLICKS]
         if (abs(smiley2[0] - smiley[0]) > 40
                 or abs(smiley2[1] - smiley[1]) > 40):
             messagebox.showwarning(
                 "坐标可疑",
                 f"两次点击 ☺ 表情按钮的位置相差较大"
-                f"（{smiley} → {smiley2}），可能第 ③ 步点错了位置。\n"
+                f"（{smiley} → {smiley2}），可能第 ④ 步点错了位置。\n"
                 "仍会保存，但建议重新标定或手动检查 config/stickers.json。",
                 parent=self.top)
         dx = cell2[0] - cell1[0]
@@ -279,7 +293,7 @@ class StickerConfigWindow:
                 parent=self.top)
         data = stickers.load_config(force=True)
         data["panel"] = {"smiley": list(smiley), "cell1": list(cell1),
-                         "cell2": list(cell2),
+                         "cell2": list(cell2), "custom_tab": list(tab),
                          "columns": int(data.get("columns") or 8)}
         if stickers.save_config(data):
             self._refresh_panel_label()

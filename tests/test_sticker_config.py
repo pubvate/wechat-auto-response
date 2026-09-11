@@ -9,8 +9,10 @@ import time
 import pytest
 
 tk = pytest.importorskip("tkinter")
+from tkinter import messagebox  # noqa: E402
 
 from core import stickers  # noqa: E402
+from core import sticker_config as sc  # noqa: E402
 from core.sticker_config import StickerConfigWindow  # noqa: E402
 
 SAMPLE_MAP = {f"情绪{i}": i + 1 for i in range(30)}
@@ -91,3 +93,54 @@ def test_action_buttons_stay_outside_scroll_area(win):
     assert has_btns
     # 按钮容器有实际高度，说明它没被滚动区挤掉
     assert win.scroll.canvas.winfo_height() < win.top.winfo_height()
+
+
+# ---------- 表情面板标定：5 次点击 ----------
+
+def test_calibration_requires_five_clicks():
+    """标定步骤明确为 5 步：开面板 → 切自定义 → 第一格 → 重开 → 第二格。"""
+    assert StickerConfigWindow.CALIB_CLICKS == 5
+    assert len(StickerConfigWindow.CALIB_STEPS) == 5
+    assert StickerConfigWindow.CALIB_STEPS == (
+        "☺ 表情按钮", "自定义表情分组", "第一行第一格",
+        "☺ 表情按钮（重开）", "第一行第二格")
+
+
+def test_calibration_takes_3rd_and_5th_click_as_cells(win, monkeypatch):
+    """第 ③ 下才是第一格、第 ⑤ 下是第二格（① 开面板、② 切页签、④ 重开）。"""
+    saved = {}
+    monkeypatch.setattr(stickers, "load_config", lambda force=False: {})
+    monkeypatch.setattr(stickers, "save_config",
+                        lambda data: (saved.update(data), True)[1])
+    monkeypatch.setattr(messagebox, "showinfo", lambda *a, **k: None)
+
+    clicks = [(100, 900),   # ① ☺ 表情按钮
+              (140, 700),   # ② 自定义表情分组
+              (200, 640),   # ③ 第一行第一格
+              (101, 901),   # ④ ☺ 表情按钮（重开）
+              (260, 641)]   # ⑤ 第一行第二格
+    win._handle_calibration_result(clicks)
+
+    panel = saved.get("panel") or {}
+    assert panel.get("smiley") == [100, 900]
+    assert panel.get("custom_tab") == [140, 700]
+    assert panel.get("cell1") == [200, 640]
+    assert panel.get("cell2") == [260, 641]
+
+
+def test_calibration_rejects_short_sequence(win, monkeypatch):
+    """只点了 4 下（漏了切换自定义表情页）不应写入标定。"""
+    saved = {}
+    warnings = []
+    monkeypatch.setattr(stickers, "load_config", lambda force=False: {})
+    monkeypatch.setattr(stickers, "save_config",
+                        lambda data: (saved.update(data), True)[1])
+    monkeypatch.setattr(messagebox, "showwarning",
+                        lambda *a, **k: warnings.append(a[1] if len(a) > 1 else ""))
+
+    win._handle_calibration_result([(100, 900), (200, 640),
+                                    (101, 901), (260, 641)])
+
+    assert warnings and "5" in warnings[0]
+    assert saved == {}
+    assert sc.StickerConfigWindow.CALIB_CLICKS == 5
