@@ -44,6 +44,34 @@ def _fake_history(records):
     return [{"role": r, "text": t, "time": ts} for r, t, ts in records]
 
 
+def test_update_injects_time_hint(monkeypatch, reset):
+    """记忆分析也带上当前时间（可记下"经常深夜找我"这类作息）。"""
+    hist = _fake_history([("friend", "我老家在长沙", now_iso())])
+    monkeypatch.setattr(memory.chat_history, "load_history", lambda c: hist)
+    systems = []
+    monkeypatch.setattr(memory.ai_client, "chat",
+                        lambda system, messages: systems.append(system) or "家乡=长沙")
+
+    memory.update_contact_memory("小明")
+
+    assert systems and "【当前时间】" in systems[0]
+
+
+def test_update_omits_time_hint_when_disabled(monkeypatch, reset):
+    monkeypatch.setattr(config, "_settings", config.Settings(
+        dry_run=False, memory_analyze_hours=24, memory_analyze_interval_hours=6,
+        memory_max_chars=400, inject_time_hint=False))
+    hist = _fake_history([("friend", "我老家在长沙", now_iso())])
+    monkeypatch.setattr(memory.chat_history, "load_history", lambda c: hist)
+    systems = []
+    monkeypatch.setattr(memory.ai_client, "chat",
+                        lambda system, messages: systems.append(system) or "家乡=长沙")
+
+    memory.update_contact_memory("小明")
+
+    assert systems and "【当前时间】" not in systems[0]
+
+
 def test_update_first_time(monkeypatch, reset):
     hist = _fake_history([
         ("friend", "我老家在长沙", now_iso()),

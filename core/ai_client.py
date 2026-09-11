@@ -2,9 +2,12 @@
 
 - AIClient：OpenAI 兼容接口（DeepSeek 等）的低层封装。
 - decide_context_count / build_context_messages：根据新消息动态裁剪上下文，省 token。
+- build_time_hint：把「当前时间 + 距上一条消息多久」拼成一句话，
+  作为隐含信息放进 system prompt（不写进聊天记录，也不占用对话轮次）。
 """
 
 import ssl
+from datetime import datetime
 
 from openai import OpenAI
 
@@ -85,3 +88,65 @@ def build_context_messages(new_msg, history, settings=None):
     messages = [{"role": role_map[r], "content": t} for r, t in selected]
     messages.append({"role": "user", "content": new_msg})
     return messages, len(selected)
+
+
+# ===== 隐含时间信息（让 AI 有"现在是几点、隔了多久"的概念） =====
+
+_WEEKDAY_NAMES = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
+
+# (起始小时, 叫法)：给 AI 一个人话时段，比 24 小时制数字更容易触发合时宜的回应
+_PERIODS = ((0, "凌晨"), (5, "清晨"), (8, "上午"), (11, "中午"),
+            (13, "下午"), (18, "晚上"), (23, "深夜"))
+
+_TIME_HINT_TAIL = (
+    "。你可以据此判断早晚、作息和与时间相关的话题，"
+    "但除非对方问起，不要主动报时或复述时间。"
+)
+
+
+def describe_period(hour):
+    """把小时换成中文时段（凌晨/清晨/上午/中午/下午/晚上/深夜）。"""
+    name = _PERIODS[0][1]
+    for start, label in _PERIODS:
+        if hour >= start:
+            name = label
+    return name
+
+
+def format_duration(delta):
+    """时间差 -> 中文短句，**小时粒度**（不足 1 小时算"不到 1 小时"）。
+
+    与时刻同为小时精度：同一小时内的提示文本完全一致，
+    便于命中大模型的 prompt 前缀缓存。
+    """
+    seconds = int(delta.total_seconds())
+    if seconds < 3600:
+        return "不到1小时"
+    hours = seconds // 3600
+    if hours < 24:
+        return f"{hours} 小时"
+    return f"{hours // 24} 天"
+
+
+def build_time_hint(now=None, last_msg_time=None):
+    """拼一句隐含的时间说明，供放进 system prompt。
+
+    只用**小时**精度（不给分钟）：同一小时内文本保持不变，可命中前缀缓存。
+    :param now: 当前时间（默认取系统时间，测试时可注入固定值）
+    :param last_msg_time: 上一条消息的时间（None 则省略间隔部分）
+    例：【当前时间】2026年09月12日 星期六 07点（清晨），距上一条消息 3 小时。……
+    """
+    now = now or datetime.now()
+    head = (f"【当前时间】{now.year}年{now.month:02d}月{now.day:02d}日 "
+            f"{_WEEKDAY_NAMES[now.weekday()]} "
+            f"{now.hour:02d}点（{describe_period(now.hour)}）")
+    gap = ""
+    if last_msg_time is not None:
+        try:
+            delta = now - last_msg_time
+        except TypeError:  # 一边带时区一边不带，无法相减
+            delta = None
+        # 时钟回拨/未来时间戳时略过间隔，避免出现负数
+        if delta is not None and delta.total_seconds() >= 0:
+            gap = f"，距上一条消息 {format_duration(delta)}"
+    return head + gap + _TIME_HINT_TAIL

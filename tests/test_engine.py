@@ -1,6 +1,7 @@
 """engine 发送核验测试：回复是否发出以聊天窗口 OCR 为准，失败自动重试。"""
 
 import types
+from datetime import datetime, timedelta
 
 import pytest
 from PIL import Image
@@ -200,3 +201,46 @@ def test_reply_single_sentence_no_extra_delay(monkeypatch, tmp_path):
 
     assert ok is True and sent == ["在的在的"]
     assert sleeps == [1.5]  # 仅核验前等待
+
+
+# ===== 隐含时间信息进 system prompt =====
+
+def _prompt_env(monkeypatch, tmp_path, **settings_kw):
+    """把人设/表情包/记忆都打成桩，只留时间提示这一段待测。"""
+    chat_history._history_cache.clear()
+    monkeypatch.setattr(config, "CHAT_HISTORY_DIR", str(tmp_path))
+    monkeypatch.setattr(engine.config, "get_system_prompt", lambda contact: "人设文本")
+    monkeypatch.setattr(engine.stickers, "sticker_prompt_suffix", lambda: "")
+    monkeypatch.setattr(config, "_settings", config.Settings(
+        dry_run=False, memory_inject_reply=False, **settings_kw))
+
+
+def test_reply_prompt_includes_time_hint(monkeypatch, tmp_path):
+    _prompt_env(monkeypatch, tmp_path, inject_time_hint=True)
+    chat_history.append_history(CONTACT, "friend", "早")
+    chat_history.load_history(CONTACT)[-1]["time"] = (
+        datetime.now() - timedelta(hours=2)).isoformat()
+
+    prompt = engine.build_reply_system_prompt(CONTACT)
+
+    assert prompt.startswith("人设文本")
+    assert "【当前时间】" in prompt
+    assert "距上一条消息 2 小时" in prompt
+    assert "不要主动报时" in prompt
+
+
+def test_reply_prompt_omits_time_hint_when_disabled(monkeypatch, tmp_path):
+    _prompt_env(monkeypatch, tmp_path, inject_time_hint=False)
+    chat_history.append_history(CONTACT, "friend", "早")
+
+    assert "【当前时间】" not in engine.build_reply_system_prompt(CONTACT)
+
+
+def test_last_message_time_reads_latest_record(monkeypatch, tmp_path):
+    _prompt_env(monkeypatch, tmp_path)
+    assert engine.last_message_time(CONTACT) is None  # 无记录
+    chat_history.append_history(CONTACT, "friend", "早")
+    chat_history.append_history(CONTACT, "self", "早呀")
+    latest = engine.last_message_time(CONTACT)
+    assert latest is not None
+    assert (datetime.now() - latest).total_seconds() < 60

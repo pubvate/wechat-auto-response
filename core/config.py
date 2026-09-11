@@ -75,6 +75,9 @@ class Settings:
     memory_inject_reply: bool = True  # 回复时是否注入联系人记忆
     memory_max_chars: int = 400       # 记忆文本长度上限
 
+    # 隐含时间信息：回复/记忆分析时告诉 AI 当前时间与距上条消息的间隔
+    inject_time_hint: bool = True
+
     # 平台相关
     wechat_bundle_id: str = "com.tencent.xinWeChat"  # macOS 微信 Bundle ID
     wechat_window_title: str = "微信"                # Windows 微信窗口标题（用于定位）
@@ -101,6 +104,7 @@ class Settings:
             memory_analyze_interval_hours=_env_int("MEMORY_ANALYZE_INTERVAL_HOURS", 6),
             memory_inject_reply=_env_bool("MEMORY_INJECT_REPLY", True),
             memory_max_chars=_env_int("MEMORY_MAX_CHARS", 400),
+            inject_time_hint=_env_bool("INJECT_TIME_HINT", True),
             wechat_bundle_id=os.getenv("WECHAT_BUNDLE_ID", "com.tencent.xinWeChat"),
             wechat_window_title=os.getenv("WECHAT_WINDOW_TITLE", "微信"),
         )

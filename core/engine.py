@@ -58,10 +58,22 @@ class RegionSelector:
                 return False
 
 
-def build_reply_system_prompt(contact):
-    """回复用的 system prompt：人设 +（可选）长期记忆 +（可选）表情包使用说明。"""
+def last_message_time(contact):
+    """该联系人最近一条聊天记录的时间（无记录/时间不可解析时返回 None）。"""
+    for msg in reversed(chat_history.load_history(contact)):
+        t = memory.parse_time(msg.get("time"))
+        if t is not None:
+            return t
+    return None
+
+
+def build_reply_system_prompt(contact, now=None):
+    """回复用的 system prompt：人设 +（可选）时间 +（可选）长期记忆 + 表情包说明。"""
     persona = config.get_system_prompt(contact)
     suffixes = [stickers.sticker_prompt_suffix()]
+    # 时间隐含在 system prompt 里：AI 知道现在几点、隔了多久，但不会写进聊天记录
+    if config.get_settings().inject_time_hint:
+        suffixes.append(ai_client.build_time_hint(now, last_message_time(contact)))
     if config.get_settings().memory_inject_reply:
         summary, _updated_at, _analyzed_through = memory.get_contact_memory(contact)
         if summary:

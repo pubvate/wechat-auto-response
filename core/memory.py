@@ -133,8 +133,18 @@ def update_contact_memory(contact):
         "请据此更新对这位联系人的长期记忆。"
     )
 
+    # 时间上下文：让 AI 判断"现在是几点、隔了多久"，便于记下作息类信息
+    system = MEMORY_ANALYSIS_SYSTEM
+    if settings.inject_time_hint:
+        last_time = None
+        for m in reversed(recent):
+            last_time = parse_time(m.get("time"))
+            if last_time is not None:
+                break
+        system += "\n\n" + ai_client.build_time_hint(last_msg_time=last_time)
+
     try:
-        summary = (ai_client.chat(MEMORY_ANALYSIS_SYSTEM, [
+        summary = (ai_client.chat(system, [
             {"role": "user", "content": user_content},
         ]) or "").strip()
     except Exception as e:
