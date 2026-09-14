@@ -28,6 +28,9 @@ def make_bot(monkeypatch, tmp_path):
     monkeypatch.setattr(engine.ai_client, "build_context_messages",
                         lambda new_msg, history: ([], 0))
     monkeypatch.setattr(wechat_ui, "read_results", lambda reader, img: [])
+    # 句间检测默认无表情包插话（表情包检测依赖真实 opencv 图形，测试统一关闭）
+    monkeypatch.setattr(wechat_ui, "detect_sticker_region",
+                        lambda img, results=None: None)
     bot = engine.WechatBot(reader=None)
     return bot, sent
 
@@ -180,8 +183,8 @@ def test_reply_sent_sentence_by_sentence(monkeypatch, tmp_path):
     assert ok is True
     # 三句逐条发送，句末句号不保留，括号描述不出现
     assert sent == ["好的呀", "我这就过来", "等我哈！"]
-    # 两个句间延时 + 核验前的等待
-    assert sleeps == [2.0, 2.0, 1.5]
+    # 两个句间延时各被切成 0.5 秒片轮询（2.0s / 0.5s = 4 片），核验前再等 1.5s
+    assert sleeps == [0.5] * 8 + [1.5]
     # 历史记录保存整理后的完整文本（带句号），AI 上下文保持自然
     self_msg = [m["text"] for m in chat_history.load_history(CONTACT)
                 if m["role"] == "self"][0]
@@ -201,6 +204,53 @@ def test_reply_single_sentence_no_extra_delay(monkeypatch, tmp_path):
 
     assert ok is True and sent == ["在的在的"]
     assert sleeps == [1.5]  # 仅核验前等待
+
+
+def test_friend_interrupt_stops_sending(monkeypatch, tmp_path):
+    """句间检测到对方插话 -> 停止发送剩余句子、丢弃剩余、记录已发部分。"""
+    bot, sent = make_bot(monkeypatch, tmp_path)
+    monkeypatch.setattr(engine.time, "sleep", lambda sec: None)
+    monkeypatch.setattr(engine.random, "uniform", lambda lo, hi: 2.0)
+    monkeypatch.setattr(engine.ai_client, "chat",
+                        lambda prompt, msgs: "第一句。第二句。第三句。")
+    # 句间检测时看到对方新消息（side=friend 且文本 != 正在回复的 new_msg）
+    monkeypatch.setattr(wechat_ui, "get_last_message_with_side",
+                        lambda results, img: ("插话了", "friend"))
+
+    response, ok = bot.auto_reply(CONTACT, "在吗", (0, 0, 400, 400))
+
+    assert ok is True
+    # 发完第一句即发现插话，剩余两句被丢弃
+    assert sent == ["第一句"]
+    # 历史记录只保存已发出的部分，不写没发出的
+    self_msg = [m["text"] for m in chat_history.load_history(CONTACT)
+                if m["role"] == "self"][0]
+    assert self_msg == "第一句"
+    # 不进 pending、不重发，插话交给下一轮主循环
+    assert bot.pending_replies == {}
+
+
+def test_friend_interrupt_by_sticker(monkeypatch, tmp_path):
+    """句间对方表情包插话（OCR 无文字）-> 同样停止发送剩余句子。"""
+    bot, sent = make_bot(monkeypatch, tmp_path)
+    monkeypatch.setattr(engine.time, "sleep", lambda sec: None)
+    monkeypatch.setattr(engine.random, "uniform", lambda lo, hi: 2.0)
+    monkeypatch.setattr(engine.ai_client, "chat",
+                        lambda prompt, msgs: "第一句。第二句。")
+    # 文字核验看不到对方文字，但表情包检测命中（靠左表情包）
+    monkeypatch.setattr(wechat_ui, "get_last_message_with_side",
+                        lambda results, img: ("", "unknown"))
+    monkeypatch.setattr(wechat_ui, "detect_sticker_region",
+                        lambda img, results=None: (0, 100, 120, 80))
+
+    response, ok = bot.auto_reply(CONTACT, "在吗", (0, 0, 400, 400))
+
+    assert ok is True
+    assert sent == ["第一句"]
+    self_msg = [m["text"] for m in chat_history.load_history(CONTACT)
+                if m["role"] == "self"][0]
+    assert self_msg == "第一句"
+    assert bot.pending_replies == {}
 
 
 # ===== 隐含时间信息进 system prompt =====

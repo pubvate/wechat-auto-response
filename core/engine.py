@@ -165,6 +165,43 @@ class WechatBot:
         # 回复是否发出以聊天窗口 OCR 为准，未确认发出的保留在此，下一轮重发。
         self.pending_replies = {}  # 联系人 -> (朋友消息, 已生成回复文本, 表情情绪或 None)
 
+    # 句间轮询检测对方插话的最小间隔（秒）
+    _INTERRUPT_POLL = 0.5
+
+    def _friend_interrupted(self, chat_region, new_msg):
+        """句间检测：聊天区最后一条是否已变成对方的新消息（文字或表情包）。
+
+        正常情况我们刚发完一句，最后一条应是我方（side=self）。若变成
+        friend 且文本与正在回复的 new_msg 不同，说明对方插话了；对方靠左
+        的表情包插话（OCR 无文字）也一并判定为插话。
+        """
+        try:
+            img = platform.screenshot(region=chat_region)
+            results = wechat_ui.read_results(self.reader, img)
+            last_msg, side = wechat_ui.get_last_message_with_side(results, img)
+            if side == "friend" and last_msg and last_msg != new_msg:
+                return True
+            # 对方表情包插话：OCR 无文字，靠左的表情包即视为对方新消息
+            if wechat_ui.detect_sticker_region(img, results):
+                return True
+        except Exception as e:
+            print(f"[检测插话] 失败，忽略：{e}")
+        return False
+
+    def _interruptible_wait(self, seconds, chat_region, new_msg):
+        """可被打断的等待：把等待切成 0.5 秒片，每片醒来检测对方是否插话。
+
+        返回 True 表示等待期内检测到对方新消息（调用方应停止发送剩余句子）。
+        """
+        remaining = seconds
+        while remaining > 0:
+            step = min(self._INTERRUPT_POLL, remaining)
+            time.sleep(step)
+            remaining -= step
+            if self._friend_interrupted(chat_region, new_msg):
+                return True
+        return False
+
     def auto_reply(self, contact, new_msg, chat_region):
         """带上下文的自动回复：读记录 -> 调 AI -> 发送 -> OCR 核验确实发出。
 
@@ -227,21 +264,32 @@ class WechatBot:
                 stickers.send_sticker(sticker_emotion)
 
         # 按句号拆成多句，逐句分时发送（句间随机延时 1~3 秒，句末句号不保留）。
-        # 拆分/发送/句间等待全程在本方法内同步完成——期间主循环不会去检查
-        # 其它联系人的新消息、也不会切换激活别的聊天窗口，全部发完才返回。
+        # 句间等待改为「可打断」：每 0.5 秒轮询一次聊天区，若对方插话则
+        # 立即停止发送剩余句子（丢弃），把插话交给下一轮主循环正常回复。
+        # 发送/句间等待仍同步完成——不会切换到别的聊天窗口。
         sentences = split_reply_sentences(response_msg) or [response_msg]
         if len(sentences) > 1:
             print(f"[{contact}] 回复拆分为 {len(sentences)} 句，逐句分时发送")
 
+        interrupted = False
+        sent_parts = []  # 本次尝试已成功发出的句子（打断时精确记录，不写未发出的）
+
         for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
+            sent_parts.clear()
             for i, sentence in enumerate(sentences, 1):
                 platform.send_message(sentence)
+                sent_parts.append(sentence)
                 if len(sentences) > 1:
                     print(f"[{contact}] 已发送第 {i}/{len(sentences)} 句：{sentence}")
                 if i < len(sentences):
                     delay = random.uniform(*SENTENCE_DELAY_RANGE)
                     print(f"[{contact}] 等待 {delay:.1f} 秒后发送下一句...")
-                    time.sleep(delay)
+                    if self._interruptible_wait(delay, chat_region, new_msg):
+                        interrupted = True
+                        print(f"[{contact}] 句间检测到对方新消息，停止发送剩余句子")
+                        break
+            if interrupted:
+                break
             print(f"等待界面稳定后核验发送结果（第 {attempt}/{MAX_SEND_ATTEMPTS} 次）...")
             time.sleep(1.5)
             verify_img = platform.screenshot(region=chat_region)
@@ -258,6 +306,16 @@ class WechatBot:
                 return response_msg, True
             print(f"[{contact}] 聊天窗口最后一条仍是对方消息，本次发送可能未成功"
                   f"（输入焦点可能不在聊天输入框）")
+
+        if interrupted:
+            # 对方插话：已发出部分句子，剩余丢弃；插话交给下一轮主循环回复。
+            # 不再补发表情包（对话节奏已被打断），也不进 pending 重发。
+            sent_text = "。".join(sent_parts)
+            chat_history.append_history(contact, "self", sent_text)
+            self.pending_replies.pop(contact, None)
+            print(f"[{contact}] 因对方插话，已发送 {len(sent_parts)}/{len(sentences)} 句，其余丢弃")
+            return sent_text, True
+
         self.pending_replies[contact] = (new_msg, response_msg, sticker_emotion)
         return response_msg, False
 
