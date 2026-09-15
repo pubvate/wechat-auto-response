@@ -157,9 +157,12 @@ def send_sticker(emotion):
         return False
     try:
         x, y = index_to_point(index, panel)
-        platform.click(*panel["smiley"])
+        # 表情包同样是靠绝对坐标点出来的，必须确认点在微信上，
+        # 否则会点在别人窗口里（点开菜单、点到按钮……）
+        if not platform.click_in_wechat(*panel["smiley"]):
+            return False
         time.sleep(PANEL_OPEN_DELAY)
-        platform.click(x, y)  # 点击格子后面板自动收起，无需再按 Esc
+        platform.click_in_wechat(x, y)  # 点击格子后面板自动收起，无需再按 Esc
         time.sleep(STICKER_CLICK_DELAY)
         print(f"已发送表情包：{emotion}（面板第 {index} 格）")
         return True

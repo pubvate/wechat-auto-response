@@ -24,6 +24,16 @@ from .utils import clamp_region, compare_images, to_screen_point
 
 MAX_SEND_ATTEMPTS = 3  # 单条回复的最大发送尝试次数（每次发送后 OCR 核验是否真的发出）
 
+# 同一条回复「跨轮重发」的次数上限。只有 OCR 核验失败才会进入重发，
+# 而核验本身可能因界面动画/滚动误判；不设上限就会变成无限重发，
+# 每次都把微信抢到前台一次 —— 表现出来就是「窗口被反复切来切去」。
+PENDING_MAX_RETRIES = 3
+
+# 因「微信不在最前面」而中止发送后，对该联系人的冷却时间（秒）。
+# 这是环境问题（窗口被挡/最小化、权限被拒），不是内容问题；
+# 立刻重试只会重新抢一次窗口、再灌一遍内容到别人的窗口，所以先静置一段时间。
+SEND_BLOCK_COOLDOWN = 60
+
 # 括号内的状态/动作描述（如「（微笑）」「(想了想)」），发送前整体删除
 _PAREN_STATUS_RE = re.compile(r"[（(][^（()）]*[)）]")
 
@@ -141,7 +151,11 @@ def handle_badges(reader, list_img, list_region):
                                  row_center_y)
         print(f"点击屏幕坐标 ({px:.0f}, {py:.0f})")
         for attempt in (1, 2):
-            platform.click(px, py)
+            # 点击前先确认微信在最前面；否则这一下会点进别人窗口里
+            if not platform.click_in_wechat(px, py):
+                print(f"「{matched}」所在会话未能确认激活，本轮跳过回复"
+                      f"（避免向错误窗口发送）")
+                return None
             time.sleep(1.0)
             if _verify_switched(list_region, by, row_height):
                 return matched
@@ -163,7 +177,9 @@ class WechatBot:
         self.last_selected_y = None  # 上一轮识别到的高亮行 y，用于判断是否需重新 OCR
         # 联系人 -> (朋友消息, 已生成但未确认发出的回复文本)。
         # 回复是否发出以聊天窗口 OCR 为准，未确认发出的保留在此，下一轮重发。
-        self.pending_replies = {}  # 联系人 -> (朋友消息, 已生成回复文本, 表情情绪或 None)
+        # 元组为 (朋友消息, 回复文本, 表情情绪或 None, 已重发次数)。
+        self.pending_replies = {}  # 联系人 -> (朋友消息, 已生成回复文本, 表情情绪或 None, 重发次数)
+        self.send_block_until = {}   # 联系人 -> 冷却截止时间戳（微信不在前台导致中止）
 
     # 句间轮询检测对方插话的最小间隔（秒）
     _INTERRUPT_POLL = 0.5
@@ -228,11 +244,19 @@ class WechatBot:
                 print(f"[{contact}]（测试模式）将发送表情包：{tag}")
             return response_msg, True
 
-        # 上次生成的回复未确认发出、且还是同一条朋友消息 -> 直接重发，不重复调 AI
+        # 上次生成的回复未确认发出、且还是同一条朋友消息 -> 直接重发，不重复调 AI。
+        # 但重发次数有上限：核验可能因界面动画误判，无上限重发会变成无限抢窗口。
+        retries = 0
         pending = self.pending_replies.get(contact)
         if pending and pending[0] == new_msg:
-            response_msg, sticker_emotion = pending[1], pending[2]
-            print(f"[{contact}] 上次回复未确认发出，重发同一回复")
+            response_msg, sticker_emotion, retries = pending[1], pending[2], pending[3]
+            if retries >= PENDING_MAX_RETRIES:
+                print(f"[{contact}] 同一条回复已重发 {retries} 次仍未确认发出，放弃重发"
+                      f"（请检查微信窗口是否正常显示、程序是否有「辅助功能」权限）")
+                self.pending_replies.pop(contact, None)
+                self.send_block_until[contact] = time.time() + SEND_BLOCK_COOLDOWN
+                return None, False
+            print(f"[{contact}] 上次回复未确认发出，重发同一回复（第 {retries + 1} 次）")
         else:
             response_msg = ai_client.chat(
                 build_reply_system_prompt(contact), context_messages)
@@ -272,12 +296,18 @@ class WechatBot:
             print(f"[{contact}] 回复拆分为 {len(sentences)} 句，逐句分时发送")
 
         interrupted = False
+        blocked = False  # 微信不在最前面：环境问题，立即中止且不做原地重试
         sent_parts = []  # 本次尝试已成功发出的句子（打断时精确记录，不写未发出的）
 
         for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
             sent_parts.clear()
             for i, sentence in enumerate(sentences, 1):
-                platform.send_message(sentence)
+                # 发之前先确认微信真的在最前面；确认不了就一个字都不发。
+                # 关键：这个失败也**不能**进入重试——继续试只会再抢一次窗口、
+                # 再把内容灌进当时最前面的那个窗口。
+                if not platform.send_message(sentence):
+                    blocked = True
+                    break
                 sent_parts.append(sentence)
                 if len(sentences) > 1:
                     print(f"[{contact}] 已发送第 {i}/{len(sentences)} 句：{sentence}")
@@ -288,7 +318,7 @@ class WechatBot:
                         interrupted = True
                         print(f"[{contact}] 句间检测到对方新消息，停止发送剩余句子")
                         break
-            if interrupted:
+            if interrupted or blocked:
                 break
             print(f"等待界面稳定后核验发送结果（第 {attempt}/{MAX_SEND_ATTEMPTS} 次）...")
             time.sleep(1.5)
@@ -307,6 +337,20 @@ class WechatBot:
             print(f"[{contact}] 聊天窗口最后一条仍是对方消息，本次发送可能未成功"
                   f"（输入焦点可能不在聊天输入框）")
 
+        if blocked:
+            # 微信不在最前面：一个字都不再往下发（继续试只会继续往别人的窗口灌）。
+            # 已发出的部分照实记录；剩余丢弃，且**不写入 pending**——
+            # 否则下一轮会拿着同样的坐标再冲一次，形成"反复抢窗口"的雪球。
+            # 改为让该联系人冷却一段时间，等人把微信窗口恢复正常。
+            if sent_parts:
+                chat_history.append_history(contact, "self", "。".join(sent_parts))
+            self.pending_replies.pop(contact, None)
+            self.send_block_until[contact] = time.time() + SEND_BLOCK_COOLDOWN
+            print(f"[{contact}] 微信不在最前面，已中止发送"
+                  f"（已发出 {len(sent_parts)}/{len(sentences)} 句），"
+                  f"{SEND_BLOCK_COOLDOWN} 秒内不再尝试该联系人")
+            return (response_msg if sent_parts else None), False
+
         if interrupted:
             # 对方插话：已发出部分句子，剩余丢弃；插话交给下一轮主循环回复。
             # 不再补发表情包（对话节奏已被打断），也不进 pending 重发。
@@ -316,7 +360,7 @@ class WechatBot:
             print(f"[{contact}] 因对方插话，已发送 {len(sent_parts)}/{len(sentences)} 句，其余丢弃")
             return sent_text, True
 
-        self.pending_replies[contact] = (new_msg, response_msg, sticker_emotion)
+        self.pending_replies[contact] = (new_msg, response_msg, sticker_emotion, retries)
         return response_msg, False
 
     def run(self, list_region, chat_region, stop_event=None):
@@ -369,6 +413,16 @@ class WechatBot:
                     time.sleep(2)
                     continue
 
+                # 上次因「微信不在最前面」中止过：冷却期内直接跳过，
+                # 免得主循环每 2 秒又抢一次窗口、又灌一遍到别的窗口
+                cooldown_left = self.send_block_until.get(
+                    self.current_contact, 0) - time.time()
+                if cooldown_left > 0:
+                    print(f"「{self.current_contact}」上次发送未成功"
+                          f"（微信不在最前面），冷却中，剩余 {cooldown_left:.0f} 秒")
+                    time.sleep(2)
+                    continue
+
                 base_screenshot = self.base_by_contact.get(self.current_contact)
 
                 # 3) 只有聊天区像素真的变了才做 OCR（easyocr 很慢，截图比对很便宜）
@@ -406,14 +460,18 @@ class WechatBot:
                     if sent:
                         # 回复后顺手更新该联系人的长期记忆（有新增记录时才调 AI）
                         memory.update_contact_memory(self.current_contact)
-                        print("等待界面稳定...")
-                        time.sleep(1.5)
-                        self.base_by_contact[self.current_contact] = platform.screenshot(
-                            region=chat_region)
+                        self.send_block_until.pop(self.current_contact, None)
+                        print(f"[{self.current_contact}] 回复已发出")
                     else:
-                        # 发送未确认成功：不更新基线，下一轮强制 OCR 复核并自动重试
-                        self.base_by_contact[self.current_contact] = None
+                        # 发送未确认成功：下一轮强制 OCR 复核并自动重试
                         print(f"[{self.current_contact}] 回复未确认发出，下一轮将自动重试")
+                    # 关键：回复结束后**不在这里重设基线**，而是清空（None）强制下一轮
+                    # 重新 OCR。若在这里重截一张当基线，而对方在我们发送回复 /
+                    # 更新记忆期间又快速发来新消息，这条新消息会被那张截图一并
+                    # 「吞进」基线，下一轮比对就会误判「聊天区无变化」而跳过 OCR，
+                    # 对方的新消息因此永远不被回复。清空后由下一轮按聊天区**实际
+                    # 显示的最后一条**决定「回复 / 重试 / 无需回复」，绝不漏消息。
+                    self.base_by_contact[self.current_contact] = None
                 else:
                     if side == "self" and last_msg:
                         # 记录我方手动发送的消息（AI 回复已在 auto_reply 里记录，去重由 append 处理）

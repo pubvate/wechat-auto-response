@@ -81,6 +81,9 @@ class Settings:
     # 平台相关
     wechat_bundle_id: str = "com.tencent.xinWeChat"  # macOS 微信 Bundle ID
     wechat_window_title: str = "微信"                # Windows 微信窗口标题（用于定位）
+    # 发送/点击前先确认「微信真的在最前面」，不是就放弃本次操作。
+    # 这是防止消息被粘贴到其它窗口（比如你正在用的编辑器/浏览器）的最后一道闸。
+    verify_wechat_foreground: bool = True
 
     @classmethod
     def from_env(cls):
@@ -107,6 +110,7 @@ class Settings:
             inject_time_hint=_env_bool("INJECT_TIME_HINT", True),
             wechat_bundle_id=os.getenv("WECHAT_BUNDLE_ID", "com.tencent.xinWeChat"),
             wechat_window_title=os.getenv("WECHAT_WINDOW_TITLE", "微信"),
+            verify_wechat_foreground=_env_bool("VERIFY_WECHAT_FOREGROUND", True),
         )
 
 

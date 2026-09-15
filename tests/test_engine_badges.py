@@ -46,8 +46,10 @@ def env(monkeypatch):
 
     monkeypatch.setattr(wechat_ui, "detect_selected_row_y", fake_selected)
     monkeypatch.setattr(platform, "screenshot", lambda region=None: img)
-    monkeypatch.setattr(platform, "click",
-                        lambda x, y: state["clicks"].append((x, y)))
+    # 点击统一走 click_in_wechat（内部先确认微信在最前面）；这里默认放行。
+    monkeypatch.setattr(platform, "click_in_wechat",
+                        lambda x, y, allow_activate=None:
+                        (state["clicks"].append((x, y)) or True))
     monkeypatch.setattr(time, "sleep", lambda s: None)
     state["img"] = img
     return state
@@ -92,6 +94,16 @@ def test_click_verify_fail_twice_gives_up(env):
 def test_badge_on_current_selected_row_skips_click(env):
     """角标所在行就是当前高亮会话 -> 不点击，直接跳过。"""
     env["selected_results"] = [BY]
+    result = engine.handle_badges(FakeReader(), env["img"], LIST_REGION)
+    assert result is None
+    assert env["clicks"] == []
+
+
+def test_click_skipped_when_wechat_not_frontmost(env, monkeypatch):
+    """微信不在最前面 -> 一下都不点（否则会点进别人窗口），放弃本轮。"""
+    monkeypatch.setattr(platform, "click_in_wechat",
+                        lambda x, y, allow_activate=None: False)
+    env["selected_results"] = [None, BY + 10]
     result = engine.handle_badges(FakeReader(), env["img"], LIST_REGION)
     assert result is None
     assert env["clicks"] == []

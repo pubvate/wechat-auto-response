@@ -22,7 +22,13 @@ def make_bot(monkeypatch, tmp_path):
     monkeypatch.setattr(engine.platform, "screenshot",
                         lambda region=None: Image.new("RGB", (400, 400), (255, 255, 255)))
     sent = []
-    monkeypatch.setattr(engine.platform, "send_message", lambda text: sent.append(text))
+
+    def fake_send(text):
+        """默认模拟「微信在最前面、按键已发出」。返回 False 的用例见下方专测。"""
+        sent.append(text)
+        return True
+
+    monkeypatch.setattr(engine.platform, "send_message", fake_send)
     monkeypatch.setattr(engine.time, "sleep", lambda sec: None)
     monkeypatch.setattr(engine, "build_reply_system_prompt", lambda contact: "persona")
     monkeypatch.setattr(engine.ai_client, "build_context_messages",
@@ -69,13 +75,13 @@ def test_send_failure_keeps_pending(monkeypatch, tmp_path):
     assert len(sent) == engine.MAX_SEND_ATTEMPTS
     roles = [m["role"] for m in chat_history.load_history(CONTACT)]
     assert roles == ["friend"]  # 未确认发出就不记 self
-    assert bot.pending_replies[CONTACT] == ("在吗", "在的在的", None)
+    assert bot.pending_replies[CONTACT] == ("在吗", "在的在的", None, 0)
 
 
 def test_retry_reuses_pending_without_ai(monkeypatch, tmp_path):
     """同一朋友消息重试 -> 直接重发上次生成的文本，不再调 AI。"""
     bot, sent = make_bot(monkeypatch, tmp_path)
-    bot.pending_replies[CONTACT] = ("在吗", "上次生成的回复", None)
+    bot.pending_replies[CONTACT] = ("在吗", "上次生成的回复", None, 0)
     monkeypatch.setattr(wechat_ui, "get_last_message_with_side",
                         lambda results, img: ("上次生成的回复", "self"))
 
@@ -141,7 +147,44 @@ def test_run_failed_reply_forces_next_round_ocr(monkeypatch, tmp_path):
         bot.run((0, 0, 400, 400), (400, 0, 400, 400))
 
     assert bot.base_by_contact[CONTACT] is None
-    assert bot.pending_replies[CONTACT] == ("在吗", "在的在的", None)
+    assert bot.pending_replies[CONTACT] == ("在吗", "在的在的", None, 0)
+
+
+def test_run_success_clears_baseline_to_force_next_ocr(monkeypatch, tmp_path):
+    """回复成功后基线必须清空（None），下一轮强制 OCR。
+
+    若回复后在主循环里重截一张当基线，对方在「发送回复 / 更新记忆」期间
+    快速发来的新消息会被那张截图吞进基线，下一轮比对误判「聊天区无变化」
+    而跳过 OCR，新消息永远不被回复——本用例锁死这一行为。
+    """
+    bot, sent = make_bot(monkeypatch, tmp_path)
+    monkeypatch.setattr(config, "get_whitelist", lambda: [])
+    monkeypatch.setattr(config, "whitelist_active", lambda: False)
+    monkeypatch.setattr(engine, "handle_badges", lambda *a, **kw: None)
+    monkeypatch.setattr(wechat_ui, "detect_selected_row_y", lambda img: (10, 40))
+    monkeypatch.setattr(wechat_ui, "estimate_row_height", lambda *a, **kw: 40)
+    monkeypatch.setattr(wechat_ui, "identify_contact_at_y", lambda *a, **kw: CONTACT)
+    # 主循环首次看到对方消息 -> 触发回复；核验时看到我方气泡 -> 确认发出
+    calls = {"n": 0}
+
+    def fake_last(results, img):
+        calls["n"] += 1
+        return ("在吗", "friend") if calls["n"] == 1 else ("在的在的", "self")
+    monkeypatch.setattr(wechat_ui, "get_last_message_with_side", fake_last)
+    monkeypatch.setattr(engine.ai_client, "chat", lambda prompt, msgs: "在的在的")
+    monkeypatch.setattr(engine.memory, "update_contact_memory", lambda contact: None)
+
+    def fake_sleep(sec):
+        if sec == 2:
+            raise KeyboardInterrupt
+    monkeypatch.setattr(engine.time, "sleep", fake_sleep)
+
+    with pytest.raises(KeyboardInterrupt):
+        bot.run((0, 0, 400, 400), (400, 0, 400, 400))
+
+    assert sent == ["在的在的"]
+    # 成功后基线被清空 -> 下一轮必定重新 OCR，不会漏掉快速到达的新消息
+    assert bot.base_by_contact[CONTACT] is None
 
 
 # ===== 回复文本清理与分句发送 =====
@@ -294,3 +337,97 @@ def test_last_message_time_reads_latest_record(monkeypatch, tmp_path):
     latest = engine.last_message_time(CONTACT)
     assert latest is not None
     assert (datetime.now() - latest).total_seconds() < 60
+
+
+# ===== 防「消息发到别的窗口」：前台校验失败必须中止，不能原地重试 =====
+
+def test_send_blocked_when_wechat_not_frontmost(monkeypatch, tmp_path):
+    """微信不在最前面 -> 一个字都不发、不记 self、不进 pending，并进入冷却。
+
+    这是防止「内容被粘贴到别的窗口」+「反复抢窗口重试」的核心闸门：
+    发送失败必须**中止**，绝不能原地重试。
+    """
+    bot, sent = make_bot(monkeypatch, tmp_path)
+    monkeypatch.setattr(engine.platform, "send_message", lambda text: False)
+    monkeypatch.setattr(engine.ai_client, "chat", lambda prompt, msgs: "在的在的")
+
+    response, ok = bot.auto_reply(CONTACT, "在吗", (0, 0, 400, 400))
+
+    assert ok is False
+    assert sent == []                  # 一个字都没发出去
+    assert response is None
+    roles = [m["role"] for m in chat_history.load_history(CONTACT)]
+    assert roles == ["friend"]         # 只记了对方消息
+    assert bot.pending_replies == {}   # 不进 pending，下一轮不会拿同样坐标再冲
+    assert bot.send_block_until[CONTACT] > 0
+
+
+def test_partial_send_blocked_records_only_sent_parts(monkeypatch, tmp_path):
+    """多句回复中途微信被切走 -> 只记录已发出的句子，剩余丢弃并冷却。"""
+    bot, sent = make_bot(monkeypatch, tmp_path)
+    calls = {"n": 0}
+
+    def flaky_send(text):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            return False           # 第二句起微信已不在前台
+        sent.append(text)
+        return True
+
+    monkeypatch.setattr(engine.platform, "send_message", flaky_send)
+    monkeypatch.setattr(engine.time, "sleep", lambda sec: None)
+    monkeypatch.setattr(engine.random, "uniform", lambda lo, hi: 2.0)
+    monkeypatch.setattr(engine.ai_client, "chat",
+                        lambda prompt, msgs: "第一句。第二句。第三句。")
+
+    response, ok = bot.auto_reply(CONTACT, "在吗", (0, 0, 400, 400))
+
+    assert ok is False and sent == ["第一句"]
+    self_msgs = [m["text"] for m in chat_history.load_history(CONTACT)
+                 if m["role"] == "self"]
+    assert self_msgs == ["第一句"]      # 没发出去的不写进历史
+    assert bot.pending_replies == {}
+    assert bot.send_block_until[CONTACT] > 0
+
+
+def test_pending_retry_capped(monkeypatch, tmp_path):
+    """同一回复重发到上限 -> 放弃重发（不再抢窗口），转为冷却。"""
+    bot, sent = make_bot(monkeypatch, tmp_path)
+    bot.pending_replies[CONTACT] = (
+        "在吗", "在的在的", None, engine.PENDING_MAX_RETRIES)
+
+    def forbidden_chat(prompt, msgs):
+        raise AssertionError("达到重发上限后不应再调 AI")
+    monkeypatch.setattr(engine.ai_client, "chat", forbidden_chat)
+
+    response, ok = bot.auto_reply(CONTACT, "在吗", (0, 0, 400, 400))
+
+    assert ok is False and response is None
+    assert sent == []                   # 一次都没发
+    assert bot.pending_replies == {}
+    assert bot.send_block_until[CONTACT] > 0
+
+
+def test_run_skips_contact_in_send_cooldown(monkeypatch, tmp_path):
+    """发送失败冷却期内直接跳过，主循环不会每 2 秒又抢一次窗口。"""
+    bot, sent = make_bot(monkeypatch, tmp_path)
+    monkeypatch.setattr(config, "get_whitelist", lambda: [])
+    monkeypatch.setattr(config, "whitelist_active", lambda: False)
+    monkeypatch.setattr(engine, "handle_badges", lambda *a, **kw: None)
+    monkeypatch.setattr(wechat_ui, "detect_selected_row_y", lambda img: (10, 40))
+    monkeypatch.setattr(wechat_ui, "estimate_row_height", lambda *a, **kw: 40)
+    monkeypatch.setattr(wechat_ui, "identify_contact_at_y", lambda *a, **kw: CONTACT)
+    monkeypatch.setattr(wechat_ui, "get_last_message_with_side",
+                        lambda results, img: ("在吗", "friend"))
+    monkeypatch.setattr(engine.ai_client, "chat", lambda prompt, msgs: "在的在的")
+    bot.send_block_until[CONTACT] = engine.time.time() + 60
+
+    def fake_sleep(sec):
+        if sec == 2:
+            raise KeyboardInterrupt
+    monkeypatch.setattr(engine.time, "sleep", fake_sleep)
+
+    with pytest.raises(KeyboardInterrupt):
+        bot.run((0, 0, 400, 400), (400, 0, 400, 400))
+
+    assert sent == []                   # 冷却中一个都没发
